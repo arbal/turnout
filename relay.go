@@ -8,6 +8,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"crypto/tls"
 	"errors"
 	"io"
 	"net"
@@ -16,15 +17,15 @@ import (
 	"strings"
 	"time"
 
+	http_dialer "github.com/mwitkow/go-http-dialer"
 	"golang.org/x/net/proxy"
 )
 
 const (
 	initialSize       = 10000
 	bufferSize        = 4096 // Not effective if speed detection is disabled (system default buffer size will be used)
-	minSampleInterval = 7    // Due to slow start, this seconds are needed for meaningful speed detection
+	minSampleInterval = 3    // Due to slow start, this seconds are needed for meaningful speed detection
 	maxSampleInterval = 30   // Too long sample period might not mean anything
-	speedRecoveryTime = 120  // Speed recovered to normal within this many seconds will be removed from slow list
 	minSpeed          = 1    // Average speed below this kB/s is likely to have special purpose
 	blockSafeTime     = 2    // After this many seconds it is less likely to be reset by firewall
 )
@@ -40,7 +41,7 @@ var (
 func (lo *localConn) getFirstByte() {
 
 	// Set initial timeout to a large value (git may have more than 1s delay)
-	lo.conn.SetReadDeadline(time.Now().Add(time.Second * 3))
+	lo.conn.SetReadDeadline(time.Now().Add(time.Second * 3)) // shared with subsequenet reads when first is incomplete
 	first := make([]byte, initialSize)
 	n, err := lo.buf.Read(first)
 	if err == nil {
@@ -53,11 +54,11 @@ func (lo *localConn) getFirstByte() {
 		}
 		return
 	}
-	lo.conn.SetReadDeadline(time.Time{})
 
 	// Prepare remote connection
 	var re remoteConn
 	re.firstIsFull = true
+	re.successive = true
 
 	// TLS
 	if n >= recordHeaderLen && recordType(first[0]) == recordTypeHandshake {
@@ -70,14 +71,17 @@ func (lo *localConn) getFirstByte() {
 				logger.Printf("%s %5d:  *            TLS handshake incomplete. Fetching another %d bytes from client", lo.mode, lo.total, n1)
 			}
 			buf := make([]byte, n1)
-			lo.conn.SetReadDeadline(time.Now().Add(time.Second * 3))
-			_, err = io.ReadFull(lo.buf, buf)
-			lo.conn.SetReadDeadline(time.Time{})
-			if err == nil {
-				first = append(first[:n], buf...)
-				n += n1
+			var n2 int
+			n2, err = io.ReadFull(lo.buf, buf)
+			if n2 > 0 {
+				if n+n2 > initialSize {
+					first = append(first[:n], buf[:n2]...)
+				} else {
+					copy(first[n:], buf[:n2])
+				}
+				n += n2
 				if *verbose {
-					logger.Printf("%s %5d:  *            First %d bytes from client", lo.mode, lo.total, n)
+					logger.Printf("%s %5d:  *            Another %d bytes from client", lo.mode, lo.total, n2)
 				}
 			}
 		}
@@ -101,30 +105,38 @@ func (lo *localConn) getFirstByte() {
 						logger.Printf("%s %5d:  *            %s Client Hello", lo.mode, lo.total, m.verString)
 					}
 				}
+				if m.earlyData {
+					if *verbose {
+						logger.Printf("%s %5d:  *            %s Early Data", lo.mode, lo.total, m.verString)
+					}
+				}
 				re.tls = true
 				re.firstIsFull = false
+				if !m.earlyData {
+					re.successive = false
+				}
 			}
 		}
 
 	} else if n > 0 {
 
-		// HTTP
-		req, err := http.ReadRequest(bufio.NewReader(bytes.NewReader(first[:n])))
+		// Make a concatenated reader
+		second := new(bytes.Buffer)
+		tee := io.TeeReader(lo.buf, second)
+		rd := io.MultiReader(bytes.NewReader(first[:n]), tee)
 
-		// Check completeness
-		if err != nil && errors.Is(err, io.ErrUnexpectedEOF) {
-			if *verbose {
-				logger.Printf("%s %5d:  *            HTTP header incomplete. Continue fetching from client", lo.mode, lo.total)
+		// HTTP
+		req, err := http.ReadRequest(bufio.NewReader(rd))
+		n2 := second.Len()
+		if n2 > 0 {
+			if n+n2 > initialSize {
+				first = append(first[:n], second.Bytes()...)
+			} else {
+				copy(first[n:], second.Bytes())
 			}
-			lo.conn.SetReadDeadline(time.Now().Add(time.Second * 1))
-			n1, _ := io.ReadFull(lo.buf, first[n:])
-			lo.conn.SetReadDeadline(time.Time{})
-			if n1 > 0 {
-				n += n1
-				if *verbose {
-					logger.Printf("%s %5d:  *            First %d bytes from client", lo.mode, lo.total, n)
-				}
-				req, err = http.ReadRequest(bufio.NewReader(bytes.NewReader(first[:n])))
+			n += n2
+			if *verbose {
+				logger.Printf("%s %5d:  *            Another %d bytes from client", lo.mode, lo.total, n2)
 			}
 		}
 
@@ -142,17 +154,32 @@ func (lo *localConn) getFirstByte() {
 		}
 	}
 
+	lo.conn.SetReadDeadline(time.Time{})
+
 	if n > 0 && n < initialSize && !re.tls && re.firstReq == nil {
 		// Allow subsequent reads within very short period of time
 		lo.conn.SetReadDeadline(time.Now().Add(time.Millisecond * 100))
 		n1, _ := io.ReadFull(lo.buf, first[n:])
 		lo.conn.SetReadDeadline(time.Time{})
 		n += n1
+		if n < initialSize {
+			re.firstIsFull = false
+		}
 	}
 
 	// Only use host as connection and routing key if dest is IP
-	if net.ParseIP(lo.dest) != nil && lo.host != "" {
-		lo.key = net.JoinHostPort(lo.host, lo.dport)
+	if ip := net.ParseIP(lo.dest); ip != nil {
+		if lo.host != "" {
+			lo.key = net.JoinHostPort(lo.host, lo.dport)
+		} else if host := getHostnameFromIP(ip); host != "" {
+			if *verbose {
+				logger.Printf("%s %5d:  *            Hostname resolved to %s", lo.mode, lo.total, host)
+			}
+			lo.host = host
+			lo.key = net.JoinHostPort(host, lo.dport)
+		} else {
+			lo.key = net.JoinHostPort(lo.dest, lo.dport)
+		}
 	} else {
 		lo.key = net.JoinHostPort(lo.dest, lo.dport)
 	}
@@ -193,12 +220,12 @@ func (re *remoteConn) getRouteFor(lo localConn) bool {
 		start[i] = make(chan bool)
 	}
 	try1 := make(chan int, 1)
-	try2 := make(chan int, len(socks))
+	try2 := make(chan int, len(proxies))
 	stop2 := make(chan bool, 1)
 	do1 := make(chan int, 1)
 	do2 := make(chan int, 1)
 	var out1 net.Conn
-	out2 := make([]net.Conn, len(socks))
+	out2 := make([]net.Conn, len(proxies))
 	ok1, ok2 := -1, -1
 	var available1, available2 int
 
@@ -258,12 +285,12 @@ func (re *remoteConn) getRouteFor(lo localConn) bool {
 	if route == 0 || route == 2 || route == 3 {
 		if server == 0 {
 			if route == 3 {
-				s := len(socks)
+				s := len(proxies)
 				go re.handleRemote(lo, &out2[s-1], net2, int(*r2Timeout), 3, s, start[1], try2, do2, stop2)
 				totalTimeout += int(*r2Timeout)
 				available2 = 1
 			} else {
-				for i, v := range socks {
+				for i, v := range proxies {
 					if v.pri != 0 {
 						go re.handleRemote(lo, &out2[i], net2, int(*r2Timeout), 2, i+1, start[v.pri], try2, do2, stop2)
 						totalTimeout += int(*r2Timeout)
@@ -279,11 +306,10 @@ func (re *remoteConn) getRouteFor(lo localConn) bool {
 	}
 
 	// Send signal to workers
-	successive := !re.tls
 	switch route {
 	case 0:
 		start[0] <- true
-		if !successive && server == 0 {
+		if !re.successive && server == 0 {
 			for range priority[1] {
 				start[1] <- true
 			}
@@ -291,7 +317,7 @@ func (re *remoteConn) getRouteFor(lo localConn) bool {
 	case 1:
 		start[0] <- true
 	case 2:
-		if !successive && server == 0 {
+		if !re.successive && server == 0 {
 			for range priority[1] {
 				start[1] <- true
 			}
@@ -324,7 +350,7 @@ func (re *remoteConn) getRouteFor(lo localConn) bool {
 				if !*fastSwitch {
 					if !exist {
 						if *verbose {
-							logger.Printf("%s %5d:     NEW     1 Save new route to %s", lo.mode, lo.total, lo.key)
+							logger.Printf("%s %5d:     NEW     1 Save route 1 server 1 for %s", lo.mode, lo.total, lo.key)
 						}
 						entry.save(1, 1)
 					} else {
@@ -345,14 +371,14 @@ func (re *remoteConn) getRouteFor(lo localConn) bool {
 			}
 			available1--
 			if available2 > 0 {
-				if successive {
+				if re.successive {
 					start[1] <- true
 				}
 				if server2 > 0 {
 					if !*fastSwitch {
 						if !exist {
 							if *verbose {
-								logger.Printf("%s %5d:     NEW     2 Save new route to %s", lo.mode, lo.total, lo.key)
+								logger.Printf("%s %5d:     NEW     2 Save route 2 server %d for %s", lo.mode, lo.total, server2, lo.key)
 							}
 							entry.save(2, server2)
 						} else {
@@ -398,7 +424,7 @@ func (re *remoteConn) getRouteFor(lo localConn) bool {
 					if !*fastSwitch {
 						if !exist {
 							if *verbose {
-								logger.Printf("%s %5d:     NEW     %d Save new route to %s", lo.mode, lo.total, r, lo.key)
+								logger.Printf("%s %5d:     NEW     %d Save route %d server %d for %s", lo.mode, lo.total, r, r, server2, lo.key)
 							}
 							entry.save(r, server2)
 						} else {
@@ -418,7 +444,7 @@ func (re *remoteConn) getRouteFor(lo localConn) bool {
 					if !*fastSwitch {
 						if !exist {
 							if *verbose {
-								logger.Printf("%s %5d:     NEW     2 Save new route to %s", lo.mode, lo.total, lo.key)
+								logger.Printf("%s %5d:     NEW     2 Save route 2 server %d for %s", lo.mode, lo.total, server2, lo.key)
 							}
 							entry.save(2, server2)
 						} else {
@@ -441,7 +467,7 @@ func (re *remoteConn) getRouteFor(lo localConn) bool {
 					available2--
 				}
 				if available2 > 0 && server2 == 0 {
-					if successive {
+					if re.successive {
 						if count2 < len(priority[1]) {
 							start[1] <- true
 						} else if count2 < len(priority[1])+len(priority[2]) {
@@ -480,7 +506,7 @@ func (re *remoteConn) getRouteFor(lo localConn) bool {
 				if !*fastSwitch {
 					if !exist {
 						if *verbose {
-							logger.Printf("%s %5d:     NEW     2 Save new route to %s", lo.mode, lo.total, lo.key)
+							logger.Printf("%s %5d:     NEW     2 Save route 2 server %d for %s", lo.mode, lo.total, server2, lo.key)
 						}
 						entry.save(2, server2)
 					} else {
@@ -586,18 +612,62 @@ func (re *remoteConn) doRemote(lo localConn, out *net.Conn, network string, time
 		if *verbose {
 			logger.Printf("%s %5d:  *          %d Dialing to %s %s", lo.mode, lo.total, route, network, dp)
 		}
-		*out, err = net.DialTimeout(network, dp, time.Second*time.Duration(timeout))
-	} else {
-		dialer, err1 := proxy.SOCKS5("tcp", socks[server-1].addr, nil, &net.Dialer{Timeout: time.Second * time.Duration(timeout)})
-		if err1 != nil {
-			logger.Printf("%s %5d: ERR         %d Failed to dial SOCKS server %s. Error: %s", lo.mode, lo.total, route, socks[server-1].addr, err)
+		// it's possible to use client's address as source but we need to fix the return route
+		// useful when turnout is sitting between client and upstream
+		dialer := &net.Dialer{
+			Timeout: time.Second * time.Duration(timeout),
+			//LocalAddr: lo.source,
+			//Control:   transparentControl,
+		}
+		*out, err = dialer.Dial(network, dp)
+	} else if proxies[server-1].addr.Scheme == "socks5" {
+		// SOCKS5
+		server := proxies[server-1]
+		// URL.Host is hostname:port
+		addr := server.addr.Host
+		var dialer proxy.Dialer
+		var auth *proxy.Auth
+		if server.addr.User != nil {
+			auth = new(proxy.Auth)
+			auth.User = server.addr.User.Username()
+			if p, ok := server.addr.User.Password(); ok {
+				auth.Password = p
+			}
+		}
+		dialer, err = proxy.SOCKS5("tcp", addr, auth, &net.Dialer{Timeout: time.Second * time.Duration(timeout)})
+		if err != nil {
+			logger.Printf("%s %5d: ERR         %d Failed to dial server %s. Error: %s", lo.mode, lo.total, route, addr, err)
 			try <- 0
 			return
 		}
 		if *verbose {
-			logger.Printf("%s %5d:  *          %d Dialing to %s %s via %s", lo.mode, lo.total, route, network, lo.key, socks[server-1].addr)
+			logger.Printf("%s %5d:  *          %d Dialing to %s %s via %s", lo.mode, lo.total, route, network, lo.key, addr)
 		}
 		*out, err = dialer.Dial(network, lo.key)
+	} else {
+		// HTTP or HTTPS
+		server := proxies[server-1]
+		addr := server.addr.Host
+		var auth http_dialer.ProxyAuthorization
+		if server.addr.User != nil {
+			user := server.addr.User.Username()
+			password, _ := server.addr.User.Password()
+			auth = http_dialer.AuthBasic(user, password)
+		}
+		// Optional TLS configuration
+		tlsConfig := tls.Config{
+			//			MinVersion: tls.VersionTLS10,
+			//			NextProtos: []string{"http/1.1"},
+		}
+		dialer := http_dialer.New(server.addr,
+			http_dialer.WithProxyAuth(auth),
+			http_dialer.WithTls(&tlsConfig),
+			http_dialer.WithConnectionTimeout(time.Second*time.Duration(timeout)))
+		if *verbose {
+			logger.Printf("%s %5d:  *          %d Dialing to %s %s via %s", lo.mode, lo.total, route, network, lo.key, addr)
+		}
+		// HTTP dialer only accepts tcp as network
+		*out, err = dialer.Dial("tcp", lo.key)
 	}
 	// Binding to interface is not available on Go natively, you have to use raw methods for each platform (SO_BINDTODEVICE on Linux, bind() on Windows) and do communication in raw
 	// Binding to local address may not affect the routing on Linux (you can see packets out of main route with wrong source address)
@@ -1216,9 +1286,8 @@ func (re *remoteConn) writeTo(lo localConn, out io.Reader, single bool, addr net
 		reqStart := re.lastReq
 		sessionStart := re.lastReq
 		var slow, added bool
-		detectSpeed := true
-		var timeAdded time.Time
 		var speed, aveSpeed, totalSpeed, reqTime float64
+		var recovered int
 		for {
 			p := make([]byte, bufferSize)
 			var n int
@@ -1258,38 +1327,40 @@ func (re *remoteConn) writeTo(lo localConn, out io.Reader, single bool, addr net
 					}
 				}
 				added = true
-				timeAdded = time.Now()
 			}
 			sample += int64(n)
 			req += int64(n)
 			// If n = bufferSize, either connection is too fast or client is slow
-			if detectSpeed && n < bufferSize {
+			if n < bufferSize {
 				sampleTime := time.Since(sampleStart).Seconds()
 				reqTime = time.Since(reqStart).Seconds()
 				if sampleTime > 0 && reqTime > 0 {
 					speed = float64(sample) / 1000 / sampleTime
 					aveSpeed = float64(req) / 1000 / reqTime
 					if sampleTime > minSampleInterval {
-						if !slow && sampleTime < maxSampleInterval {
+						if sampleTime < maxSampleInterval {
 							if (totalSpeed < float64(*slowSpeed) && aveSpeed < float64(*slowSpeed) && speed < float64(*slowSpeed) || speed < float64(*slowSpeed)*0.3) && aveSpeed > minSpeed && totalSpeed > minSpeed {
 								// Set flag to add to list only if this read is not the final one
 								slow = true
+								// Reset recovery counter
+								recovered = 0
 							}
 						}
 						sampleStart = time.Now()
 						sample = 0
 					}
 					if slow && reqTime > 0.2 && aveSpeed > float64(*slowSpeed)*1.2 && speed > float64(*slowSpeed) {
-						logger.Printf("%s %5d:     SLO     %d Speed to %s %s recovered to %.1f kB/s, %.1f kB/s since last request, %.1f kB/s overall", lo.mode, lo.total, route, lo.host, addr, speed, aveSpeed, totalSpeed)
-						slow = false
-						added = false
-						if tcpAddr := addr.(*net.TCPAddr); tcpAddr != nil && !*slowDry {
-							slowIPSet.find(tcpAddr.IP, "", true)
-							slowHostSet.find(lo.host, "", true)
+						recovered += 1
+						// Remove from slow list if speed has recovered for 3 consecutive sampling periods
+						if recovered >= 3 {
+							logger.Printf("%s %5d:     SLO     %d Speed to %s %s recovered to %.1f kB/s, %.1f kB/s since last request, %.1f kB/s overall", lo.mode, lo.total, route, lo.host, addr, speed, aveSpeed, totalSpeed)
+							slow = false
+							added = false
+							if tcpAddr := addr.(*net.TCPAddr); tcpAddr != nil && !*slowDry {
+								slowIPSet.find(tcpAddr.IP, "", true)
+								slowHostSet.find(lo.host, "", true)
+							}
 						}
-					}
-					if added && time.Since(timeAdded).Seconds() > speedRecoveryTime {
-						detectSpeed = false
 					}
 				}
 			}
